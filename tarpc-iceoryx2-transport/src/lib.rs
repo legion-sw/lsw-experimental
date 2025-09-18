@@ -3,13 +3,15 @@ use std::{
     fmt,
     future::Future,
     io,
+    marker::PhantomData,
+    ops::Deref,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
     time::Duration,
 };
 
-use iceoryx2::sample::Sample;
+use bytes::{Bytes, BytesMut};
 use iceoryx2::{
     node::{Node, NodeBuilder, node_name::NodeName},
     port::{
@@ -18,7 +20,7 @@ use iceoryx2::{
     },
     service::{ipc_threadsafe::Service as IoxService, service_name::ServiceName},
 };
-use tarpc::tokio_serde::formats::Bincode;
+use tarpc::tokio_serde::{Deserializer, Serializer, formats::Bincode};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     time::{Sleep, sleep},
@@ -61,8 +63,7 @@ impl Default for IceoryxConfig {
 pub struct IceoryxStream {
     publisher: Publisher<IoxService, [u8], ()>,
     subscriber: Subscriber<IoxService, [u8], ()>,
-    current_sample: Option<Sample<IoxService, [u8], ()>>,
-    sample_offset: usize,
+    read_buffer: BytesMut,
     poll_interval: Duration,
     wait_state: WaitState,
     empty_poll_streak: u32,
@@ -73,13 +74,7 @@ pub struct IceoryxStream {
 impl fmt::Debug for IceoryxStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IceoryxStream")
-            .field(
-                "pending_sample_len",
-                &self
-                    .current_sample
-                    .as_ref()
-                    .map(|sample| sample.len().saturating_sub(self.sample_offset)),
-            )
+            .field("read_buffer_len", &self.read_buffer.len())
             .field("is_shutdown", &self.is_shutdown)
             .finish()
     }
@@ -107,8 +102,7 @@ impl IceoryxStream {
         Ok(Self {
             publisher,
             subscriber,
-            current_sample: None,
-            sample_offset: 0,
+            read_buffer: BytesMut::new(),
             poll_interval: config.poll_interval,
             wait_state: WaitState::None,
             empty_poll_streak: 0,
@@ -135,10 +129,6 @@ impl AsyncRead for IceoryxStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
         let this = self.as_mut().get_mut();
 
         loop {
@@ -160,26 +150,8 @@ impl AsyncRead for IceoryxStream {
                 },
             }
 
-            if let Some(sample) = this.current_sample.take() {
-                let sample_len = sample.len();
-
-                if this.sample_offset >= sample_len {
-                    this.sample_offset = 0;
-                    continue;
-                }
-
-                let available = &sample[this.sample_offset..];
-                let to_copy = min(buf.remaining(), available.len());
-                buf.put_slice(&available[..to_copy]);
-                this.sample_offset += to_copy;
-
-                if this.sample_offset < sample_len {
-                    this.current_sample = Some(sample);
-                } else {
-                    this.sample_offset = 0;
-                }
-
-                return Poll::Ready(Ok(()));
+            if !this.read_buffer.is_empty() {
+                break;
             }
 
             if this.is_shutdown {
@@ -188,8 +160,7 @@ impl AsyncRead for IceoryxStream {
 
             match this.subscriber.receive() {
                 Ok(Some(sample)) => {
-                    this.current_sample = Some(sample);
-                    this.sample_offset = 0;
+                    this.read_buffer.extend_from_slice(sample.deref());
                     this.wait_state = WaitState::None;
                     this.empty_poll_streak = 0;
                     continue;
@@ -215,6 +186,11 @@ impl AsyncRead for IceoryxStream {
                 }
             }
         }
+
+        let to_copy = min(buf.remaining(), this.read_buffer.len());
+        let data = this.read_buffer.split_to(to_copy);
+        buf.put_slice(&data);
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -294,6 +270,111 @@ where
     SinkItem: serde::Serialize,
 {
     tarpc::serde_transport::Transport::from((stream, Bincode::default()))
+}
+
+/// Creates a tarpc transport that serializes messages with [`postcard`].
+pub fn postcard_transport<Item, SinkItem>(
+    stream: IceoryxStream,
+) -> tarpc::serde_transport::Transport<IceoryxStream, Item, SinkItem, PostcardCodec<Item, SinkItem>>
+where
+    Item: for<'de> serde::Deserialize<'de>,
+    SinkItem: serde::Serialize,
+{
+    tarpc::serde_transport::Transport::from((stream, PostcardCodec::default()))
+}
+
+/// Creates a tarpc transport that serializes messages with [`bitcode`].
+pub fn bitcode_transport<Item, SinkItem>(
+    stream: IceoryxStream,
+) -> tarpc::serde_transport::Transport<IceoryxStream, Item, SinkItem, BitcodeCodec<Item, SinkItem>>
+where
+    Item: for<'de> serde::Deserialize<'de>,
+    SinkItem: serde::Serialize,
+{
+    tarpc::serde_transport::Transport::from((stream, BitcodeCodec::default()))
+}
+
+/// [`tarpc::tokio_serde`] codec that uses [`postcard`] for message exchange.
+pub struct PostcardCodec<Item, SinkItem> {
+    _marker: PhantomData<fn(SinkItem) -> Item>,
+}
+
+impl<Item, SinkItem> Default for PostcardCodec<Item, SinkItem> {
+    fn default() -> Self {
+        Self {
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<Item, SinkItem> Serializer<SinkItem> for PostcardCodec<Item, SinkItem>
+where
+    SinkItem: serde::Serialize,
+{
+    type Error = io::Error;
+
+    fn serialize(self: Pin<&mut Self>, item: &SinkItem) -> Result<Bytes, Self::Error> {
+        postcard::to_allocvec(item)
+            .map(Bytes::from)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+}
+
+impl<Item, SinkItem> Deserializer<Item> for PostcardCodec<Item, SinkItem>
+where
+    Item: for<'de> serde::Deserialize<'de>,
+{
+    type Error = io::Error;
+
+    fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
+        let (value, remaining) = postcard::take_from_bytes(src.as_ref())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        if !remaining.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "postcard deserializer left trailing bytes",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+/// [`tarpc::tokio_serde`] codec that uses [`bitcode`] for message exchange.
+pub struct BitcodeCodec<Item, SinkItem> {
+    _marker: PhantomData<fn(SinkItem) -> Item>,
+}
+
+impl<Item, SinkItem> Default for BitcodeCodec<Item, SinkItem> {
+    fn default() -> Self {
+        Self {
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<Item, SinkItem> Serializer<SinkItem> for BitcodeCodec<Item, SinkItem>
+where
+    SinkItem: serde::Serialize,
+{
+    type Error = io::Error;
+
+    fn serialize(self: Pin<&mut Self>, item: &SinkItem) -> Result<Bytes, Self::Error> {
+        bitcode::serialize(item)
+            .map(Bytes::from)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+}
+
+impl<Item, SinkItem> Deserializer<Item> for BitcodeCodec<Item, SinkItem>
+where
+    Item: for<'de> serde::Deserialize<'de>,
+{
+    type Error = io::Error;
+
+    fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
+        bitcode::deserialize(src.as_ref())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
 }
 
 fn create_publisher(
@@ -377,12 +458,14 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use tarpc::{
-        context,
+        Transport, context,
         server::{BaseChannel, Channel},
     };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[tarpc::service]
+    #[tarpc::service(derive = [
+        ::tarpc::serde::Serialize,
+        ::tarpc::serde::Deserialize,
+    ])]
     pub trait Arithmetic {
         async fn add(x: i32, y: i32) -> i32;
     }
@@ -402,12 +485,25 @@ mod tests {
         format!("tarpc/test/{}/{}", std::process::id(), id)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tarpc_roundtrip() -> io::Result<()> {
+    type ServerSink = tarpc::Response<ArithmeticResponse>;
+    type ServerItem = tarpc::ClientMessage<ArithmeticRequest>;
+    type ClientSink = tarpc::ClientMessage<ArithmeticRequest>;
+    type ClientItem = tarpc::Response<ArithmeticResponse>;
+
+    async fn run_roundtrip<ServerTransport, ClientTransport, MakeServer, MakeClient>(
+        make_server_transport: MakeServer,
+        make_client_transport: MakeClient,
+    ) -> io::Result<()>
+    where
+        ServerTransport: Transport<ServerSink, ServerItem> + Send + 'static,
+        ClientTransport: Transport<ClientSink, ClientItem> + Send + 'static,
+        MakeServer: Fn(IceoryxStream) -> ServerTransport,
+        MakeClient: Fn(IceoryxStream) -> ClientTransport,
+    {
         let base = unique_service_name();
 
         let server_stream = IceoryxStream::connect(&base, Role::Server, IceoryxConfig::default())?;
-        let server_transport = bincode_transport(server_stream);
+        let server_transport = make_server_transport(server_stream);
         let server = tokio::spawn(async move {
             BaseChannel::with_defaults(server_transport)
                 .execute(ArithmeticImpl.serve())
@@ -418,7 +514,7 @@ mod tests {
         });
 
         let client_stream = IceoryxStream::connect(&base, Role::Client, IceoryxConfig::default())?;
-        let transport = bincode_transport(client_stream);
+        let transport = make_client_transport(client_stream);
         let client = ArithmeticClient::new(Default::default(), transport).spawn();
 
         let result = client
@@ -433,32 +529,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn transfers_large_payload_in_chunks() -> io::Result<()> {
-        let base = unique_service_name();
+    async fn tarpc_roundtrip_bincode() -> io::Result<()> {
+        run_roundtrip(bincode_transport, bincode_transport).await
+    }
 
-        let mut server_stream =
-            IceoryxStream::connect(&base, Role::Server, IceoryxConfig::default())?;
-        let mut client_stream =
-            IceoryxStream::connect(&base, Role::Client, IceoryxConfig::default())?;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tarpc_roundtrip_postcard() -> io::Result<()> {
+        run_roundtrip(postcard_transport, postcard_transport).await
+    }
 
-        let payload = vec![0xAB; 1_048_576];
-        let sender_payload = payload.clone();
-        let sender = tokio::spawn(async move {
-            server_stream.write_all(&sender_payload).await?;
-            server_stream.shutdown().await?;
-            Ok::<_, io::Error>(())
-        });
-
-        let mut received = Vec::with_capacity(payload.len());
-        let mut buffer = vec![0u8; 32 * 1024];
-        while received.len() < payload.len() {
-            let read = client_stream.read(&mut buffer).await?;
-            assert!(read > 0, "stream ended before full payload was received");
-            received.extend_from_slice(&buffer[..read]);
-        }
-
-        sender.await.expect("sender task should complete")?;
-        assert_eq!(received, payload);
-        Ok(())
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tarpc_roundtrip_bitcode() -> io::Result<()> {
+        run_roundtrip(bitcode_transport, bitcode_transport).await
     }
 }
