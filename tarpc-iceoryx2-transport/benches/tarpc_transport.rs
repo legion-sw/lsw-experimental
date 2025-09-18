@@ -31,35 +31,41 @@ fn unique_service_name() -> String {
 fn roundtrip_benchmark(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
 
+    let base = unique_service_name();
+
+    let (client, server) = runtime.block_on(async move {
+        let server_stream =
+            IceoryxStream::connect(&base, Role::Server, IceoryxConfig::default()).unwrap();
+        let server_transport = bincode_transport(server_stream);
+        let server = tokio::spawn(async move {
+            BaseChannel::with_defaults(server_transport)
+                .execute(ArithmeticImpl.serve())
+                .for_each(|fut| async move {
+                    tokio::spawn(fut);
+                })
+                .await;
+        });
+
+        let client_stream =
+            IceoryxStream::connect(&base, Role::Client, IceoryxConfig::default()).unwrap();
+        let transport = bincode_transport(client_stream);
+        let client = ArithmeticClient::new(Default::default(), transport).spawn();
+
+        (client, server)
+    });
+
     c.bench_function("tarpc_roundtrip", |b| {
         b.to_async(&runtime).iter(|| async {
-            let base = unique_service_name();
-
-            let server_stream =
-                IceoryxStream::connect(&base, Role::Server, IceoryxConfig::default()).unwrap();
-            let server_transport = bincode_transport(server_stream);
-            let server = tokio::spawn(async move {
-                BaseChannel::with_defaults(server_transport)
-                    .execute(ArithmeticImpl.serve())
-                    .for_each(|fut| async move {
-                        tokio::spawn(fut);
-                    })
-                    .await;
-            });
-
-            let client_stream =
-                IceoryxStream::connect(&base, Role::Client, IceoryxConfig::default()).unwrap();
-            let transport = bincode_transport(client_stream);
-            let client = ArithmeticClient::new(Default::default(), transport).spawn();
-
             let _ = client
                 .add(context::current(), 1, 2)
                 .await
                 .expect("rpc call succeeds");
-
-            drop(client);
-            server.abort();
         });
+    });
+
+    runtime.block_on(async move {
+        drop(client);
+        server.abort();
     });
 }
 
