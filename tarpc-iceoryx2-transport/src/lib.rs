@@ -1,10 +1,9 @@
 use std::{
     cmp::min,
-    fmt,
-    future::Future,
-    io,
+    fmt, io,
     marker::PhantomData,
     ops::Deref,
+    os::fd::{AsRawFd, RawFd},
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
@@ -12,19 +11,20 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use iceoryx2::prelude::FileDescriptorBased;
 use iceoryx2::{
     node::{Node, NodeBuilder, node_name::NodeName},
     port::{
+        listener::Listener,
+        notifier::Notifier,
         publisher::Publisher,
         subscriber::{Subscriber, SubscriberCreateError},
     },
     service::{ipc_threadsafe::Service as IoxService, service_name::ServiceName},
 };
 use tarpc::tokio_serde::{Deserializer, Serializer, formats::Bincode};
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    time::{Sleep, sleep},
-};
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub mod addition;
 
@@ -44,7 +44,7 @@ pub struct IceoryxConfig {
     pub max_message_size: usize,
     /// Number of messages that can be queued on the receiving side.
     pub subscriber_buffer_size: usize,
-    /// Poll interval that is used when waiting for new data from iceoryx2.
+    /// Legacy poll interval from the busy-wait implementation. Retained for API compatibility.
     pub poll_interval: Duration,
 }
 
@@ -65,10 +65,9 @@ impl Default for IceoryxConfig {
 pub struct IceoryxStream {
     publisher: Publisher<IoxService, [u8], ()>,
     subscriber: Subscriber<IoxService, [u8], ()>,
+    notifier: Notifier<IoxService>,
+    event_listener: AsyncFd<EventListener>,
     read_buffer: BytesMut,
-    poll_interval: Duration,
-    wait_state: WaitState,
-    empty_poll_streak: u32,
     is_shutdown: bool,
     _node: Node<IoxService>,
 }
@@ -101,13 +100,17 @@ impl IceoryxStream {
         let publisher = create_publisher(&node, &send_name, config.max_message_size)?;
         let subscriber = create_subscriber(&node, &recv_name, config.subscriber_buffer_size)?;
 
+        let (notify_name, listen_name) = notification_service_names(base_service, role)?;
+        let notifier = create_notifier(&node, &notify_name)?;
+        let listener = create_listener(&node, &listen_name)?;
+        let event_listener = AsyncFd::new(EventListener::new(listener))?;
+
         Ok(Self {
             publisher,
             subscriber,
+            notifier,
+            event_listener,
             read_buffer: BytesMut::new(),
-            poll_interval: config.poll_interval,
-            wait_state: WaitState::None,
-            empty_poll_streak: 0,
             is_shutdown: false,
             _node: node,
         })
@@ -121,6 +124,7 @@ impl IceoryxStream {
         let mut sample = self.publisher.loan_slice(buf.len()).map_err(to_io_error)?;
         sample.copy_from_slice(buf);
         sample.send().map_err(to_io_error)?;
+        self.notifier.notify().map_err(to_io_error)?;
         Ok(())
     }
 }
@@ -134,24 +138,6 @@ impl AsyncRead for IceoryxStream {
         let this = self.as_mut().get_mut();
 
         loop {
-            match &mut this.wait_state {
-                WaitState::None => {}
-                WaitState::Yield(fut) => match Pin::new(fut).poll(cx) {
-                    Poll::Ready(()) => {
-                        this.wait_state = WaitState::None;
-                        continue;
-                    }
-                    Poll::Pending => return Poll::Pending,
-                },
-                WaitState::Sleep(fut) => match fut.as_mut().poll(cx) {
-                    Poll::Ready(_) => {
-                        this.wait_state = WaitState::None;
-                        continue;
-                    }
-                    Poll::Pending => return Poll::Pending,
-                },
-            }
-
             if !this.read_buffer.is_empty() {
                 break;
             }
@@ -163,25 +149,19 @@ impl AsyncRead for IceoryxStream {
             match this.subscriber.receive() {
                 Ok(Some(sample)) => {
                     this.read_buffer.extend_from_slice(sample.deref());
-                    this.wait_state = WaitState::None;
-                    this.empty_poll_streak = 0;
                     continue;
                 }
-                Ok(None) => {
-                    this.empty_poll_streak = this
-                        .empty_poll_streak
-                        .saturating_add(1)
-                        .min(FAST_POLL_SPINS);
-                    let should_sleep = this.poll_interval != Duration::ZERO
-                        && this.empty_poll_streak >= FAST_POLL_SPINS;
-
-                    this.wait_state = if should_sleep {
-                        WaitState::Sleep(Box::pin(sleep(this.poll_interval)))
-                    } else {
-                        WaitState::Yield(YieldNowFuture::new())
-                    };
-                    continue;
-                }
+                Ok(None) => match this.event_listener.poll_read_ready(cx) {
+                    Poll::Ready(Ok(mut guard)) => {
+                        if let Err(err) = guard.get_inner().drain_events() {
+                            return Poll::Ready(Err(err));
+                        }
+                        guard.clear_ready();
+                        continue;
+                    }
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                },
                 Err(err) => {
                     let io_err = to_io_error(err);
                     return Poll::Ready(Err(io_err));
@@ -224,44 +204,30 @@ impl AsyncWrite for IceoryxStream {
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.is_shutdown = true;
-        this.wait_state = WaitState::None;
+        let _ = this.notifier.notify();
         Poll::Ready(Ok(()))
     }
 }
 
-const FAST_POLL_SPINS: u32 = 4096;
-
-enum WaitState {
-    None,
-    Yield(YieldNowFuture),
-    Sleep(Pin<Box<Sleep>>),
+struct EventListener {
+    listener: Listener<IoxService>,
 }
 
-struct YieldNowFuture {
-    yielded: bool,
-}
+impl EventListener {
+    fn new(listener: Listener<IoxService>) -> Self {
+        Self { listener }
+    }
 
-impl YieldNowFuture {
-    fn new() -> Self {
-        Self { yielded: false }
+    fn drain_events(&self) -> io::Result<()> {
+        self.listener.try_wait_all(|_| {}).map_err(to_io_error)
     }
 }
 
-impl Future for YieldNowFuture {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.yielded {
-            Poll::Ready(())
-        } else {
-            self.yielded = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
+impl AsRawFd for EventListener {
+    fn as_raw_fd(&self) -> RawFd {
+        unsafe { self.listener.file_descriptor().native_handle() }
     }
 }
-
-impl Unpin for YieldNowFuture {}
 
 /// Creates a tarpc transport that serializes messages with [`Bincode`].
 pub fn bincode_transport<Item, SinkItem>(
@@ -418,6 +384,36 @@ fn create_subscriber(
         })
 }
 
+fn create_notifier(
+    node: &Node<IoxService>,
+    service: &ServiceName,
+) -> io::Result<Notifier<IoxService>> {
+    let port_factory = node
+        .service_builder(service)
+        .event()
+        .open_or_create()
+        .map_err(to_io_error)?;
+    port_factory
+        .notifier_builder()
+        .create()
+        .map_err(to_io_error)
+}
+
+fn create_listener(
+    node: &Node<IoxService>,
+    service: &ServiceName,
+) -> io::Result<Listener<IoxService>> {
+    let port_factory = node
+        .service_builder(service)
+        .event()
+        .open_or_create()
+        .map_err(to_io_error)?;
+    port_factory
+        .listener_builder()
+        .create()
+        .map_err(to_io_error)
+}
+
 fn direction_service_names(base: &str, role: Role) -> io::Result<(ServiceName, ServiceName)> {
     let (out_suffix, in_suffix) = match role {
         Role::Server => ("server_to_client", "client_to_server"),
@@ -427,6 +423,19 @@ fn direction_service_names(base: &str, role: Role) -> io::Result<(ServiceName, S
     let send = ServiceName::new(&format!("{base}/{out_suffix}")).map_err(to_io_error)?;
     let recv = ServiceName::new(&format!("{base}/{in_suffix}")).map_err(to_io_error)?;
     Ok((send, recv))
+}
+
+fn notification_service_names(base: &str, role: Role) -> io::Result<(ServiceName, ServiceName)> {
+    let (notify_suffix, listen_suffix) = match role {
+        Role::Server => ("server_to_client", "client_to_server"),
+        Role::Client => ("client_to_server", "server_to_client"),
+    };
+
+    let notify =
+        ServiceName::new(&format!("{base}/{notify_suffix}/notify")).map_err(to_io_error)?;
+    let listen =
+        ServiceName::new(&format!("{base}/{listen_suffix}/notify")).map_err(to_io_error)?;
+    Ok((notify, listen))
 }
 
 fn create_node(base: &str, role: Role) -> io::Result<Node<IoxService>> {
@@ -483,6 +492,22 @@ mod tests {
     type ServerItem = tarpc::ClientMessage<AdderRequest>;
     type ClientSink = tarpc::ClientMessage<AdderRequest>;
     type ClientItem = tarpc::Response<AdderResponse>;
+
+    #[test]
+    fn notification_names_for_server_role() {
+        let base = "tarpc/test/notify";
+        let (notify, listen) = super::notification_service_names(base, Role::Server).unwrap();
+        assert_eq!(notify.as_str(), "tarpc/test/notify/server_to_client/notify");
+        assert_eq!(listen.as_str(), "tarpc/test/notify/client_to_server/notify");
+    }
+
+    #[test]
+    fn notification_names_for_client_role() {
+        let base = "tarpc/test/notify";
+        let (notify, listen) = super::notification_service_names(base, Role::Client).unwrap();
+        assert_eq!(notify.as_str(), "tarpc/test/notify/client_to_server/notify");
+        assert_eq!(listen.as_str(), "tarpc/test/notify/server_to_client/notify");
+    }
 
     async fn run_roundtrip<ServerTransport, ClientTransport, MakeServer, MakeClient>(
         make_server_transport: MakeServer,
