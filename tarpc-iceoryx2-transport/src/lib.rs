@@ -46,7 +46,7 @@ pub struct IceoryxConfig {
 impl Default for IceoryxConfig {
     fn default() -> Self {
         Self {
-            max_message_size: 64 * 1024,
+            max_message_size: 64 * 1024 * 1024,
             subscriber_buffer_size: 2,
             poll_interval: Duration::from_micros(50),
         }
