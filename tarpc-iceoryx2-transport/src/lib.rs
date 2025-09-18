@@ -3,6 +3,7 @@ use std::{
     fmt,
     future::Future,
     io,
+    marker::PhantomData,
     ops::Deref,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
@@ -10,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use iceoryx2::{
     node::{Node, NodeBuilder, node_name::NodeName},
     port::{
@@ -19,7 +20,7 @@ use iceoryx2::{
     },
     service::{ipc_threadsafe::Service as IoxService, service_name::ServiceName},
 };
-use tarpc::tokio_serde::formats::Bincode;
+use tarpc::tokio_serde::{Deserializer, Serializer, formats::Bincode};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     time::{Sleep, sleep},
@@ -273,6 +274,111 @@ where
     tarpc::serde_transport::Transport::from((stream, Bincode::default()))
 }
 
+/// Creates a tarpc transport that serializes messages with [`postcard`].
+pub fn postcard_transport<Item, SinkItem>(
+    stream: IceoryxStream,
+) -> tarpc::serde_transport::Transport<IceoryxStream, Item, SinkItem, PostcardCodec<Item, SinkItem>>
+where
+    Item: for<'de> serde::Deserialize<'de>,
+    SinkItem: serde::Serialize,
+{
+    tarpc::serde_transport::Transport::from((stream, PostcardCodec::default()))
+}
+
+/// Creates a tarpc transport that serializes messages with [`bitcode`].
+pub fn bitcode_transport<Item, SinkItem>(
+    stream: IceoryxStream,
+) -> tarpc::serde_transport::Transport<IceoryxStream, Item, SinkItem, BitcodeCodec<Item, SinkItem>>
+where
+    Item: for<'de> serde::Deserialize<'de>,
+    SinkItem: serde::Serialize,
+{
+    tarpc::serde_transport::Transport::from((stream, BitcodeCodec::default()))
+}
+
+/// [`tarpc::tokio_serde`] codec that uses [`postcard`] for message exchange.
+pub struct PostcardCodec<Item, SinkItem> {
+    _marker: PhantomData<fn(SinkItem) -> Item>,
+}
+
+impl<Item, SinkItem> Default for PostcardCodec<Item, SinkItem> {
+    fn default() -> Self {
+        Self {
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<Item, SinkItem> Serializer<SinkItem> for PostcardCodec<Item, SinkItem>
+where
+    SinkItem: serde::Serialize,
+{
+    type Error = io::Error;
+
+    fn serialize(self: Pin<&mut Self>, item: &SinkItem) -> Result<Bytes, Self::Error> {
+        postcard::to_allocvec(item)
+            .map(Bytes::from)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+}
+
+impl<Item, SinkItem> Deserializer<Item> for PostcardCodec<Item, SinkItem>
+where
+    Item: for<'de> serde::Deserialize<'de>,
+{
+    type Error = io::Error;
+
+    fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
+        let (value, remaining) = postcard::take_from_bytes(src.as_ref())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        if !remaining.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "postcard deserializer left trailing bytes",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+/// [`tarpc::tokio_serde`] codec that uses [`bitcode`] for message exchange.
+pub struct BitcodeCodec<Item, SinkItem> {
+    _marker: PhantomData<fn(SinkItem) -> Item>,
+}
+
+impl<Item, SinkItem> Default for BitcodeCodec<Item, SinkItem> {
+    fn default() -> Self {
+        Self {
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<Item, SinkItem> Serializer<SinkItem> for BitcodeCodec<Item, SinkItem>
+where
+    SinkItem: serde::Serialize,
+{
+    type Error = io::Error;
+
+    fn serialize(self: Pin<&mut Self>, item: &SinkItem) -> Result<Bytes, Self::Error> {
+        bitcode::serialize(item)
+            .map(Bytes::from)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+}
+
+impl<Item, SinkItem> Deserializer<Item> for BitcodeCodec<Item, SinkItem>
+where
+    Item: for<'de> serde::Deserialize<'de>,
+{
+    type Error = io::Error;
+
+    fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
+        bitcode::deserialize(src.as_ref())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+}
+
 fn create_publisher(
     node: &Node<IoxService>,
     service: &ServiceName,
@@ -355,9 +461,26 @@ mod tests {
     use crate::addition::Adder;
     use futures::StreamExt;
     use tarpc::{
-        context,
+        Transport, context,
         server::{BaseChannel, Channel},
     };
+
+    #[tarpc::service(derive = [
+        ::tarpc::serde::Serialize,
+        ::tarpc::serde::Deserialize,
+    ])]
+    pub trait Arithmetic {
+        async fn add(x: i32, y: i32) -> i32;
+    }
+
+    #[derive(Clone)]
+    struct ArithmeticImpl;
+
+    impl Arithmetic for ArithmeticImpl {
+        async fn add(self, _: context::Context, x: i32, y: i32) -> i32 {
+            x + y
+        }
+    }
 
     fn unique_service_name() -> String {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -365,12 +488,25 @@ mod tests {
         format!("tarpc/test/{}/{}", std::process::id(), id)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tarpc_roundtrip() -> io::Result<()> {
+    type ServerSink = tarpc::Response<ArithmeticResponse>;
+    type ServerItem = tarpc::ClientMessage<ArithmeticRequest>;
+    type ClientSink = tarpc::ClientMessage<ArithmeticRequest>;
+    type ClientItem = tarpc::Response<ArithmeticResponse>;
+
+    async fn run_roundtrip<ServerTransport, ClientTransport, MakeServer, MakeClient>(
+        make_server_transport: MakeServer,
+        make_client_transport: MakeClient,
+    ) -> io::Result<()>
+    where
+        ServerTransport: Transport<ServerSink, ServerItem> + Send + 'static,
+        ClientTransport: Transport<ClientSink, ClientItem> + Send + 'static,
+        MakeServer: Fn(IceoryxStream) -> ServerTransport,
+        MakeClient: Fn(IceoryxStream) -> ClientTransport,
+    {
         let base = unique_service_name();
 
         let server_stream = IceoryxStream::connect(&base, Role::Server, IceoryxConfig::default())?;
-        let server_transport = bincode_transport(server_stream);
+        let server_transport = make_server_transport(server_stream);
         let server = tokio::spawn(async move {
             BaseChannel::with_defaults(server_transport)
                 .execute(addition::AdderService.serve())
@@ -393,5 +529,20 @@ mod tests {
         drop(client);
         server.abort();
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tarpc_roundtrip_bincode() -> io::Result<()> {
+        run_roundtrip(bincode_transport, bincode_transport).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tarpc_roundtrip_postcard() -> io::Result<()> {
+        run_roundtrip(postcard_transport, postcard_transport).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tarpc_roundtrip_bitcode() -> io::Result<()> {
+        run_roundtrip(bitcode_transport, bitcode_transport).await
     }
 }
