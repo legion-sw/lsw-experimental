@@ -458,7 +458,7 @@ fn to_io_error<E: fmt::Display>(err: E) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addition::Adder;
+    use crate::addition::{Adder, AdderRequest, AdderResponse};
     use futures::StreamExt;
     use tarpc::{
         Transport, context,
@@ -473,29 +473,20 @@ mod tests {
         async fn add(x: i32, y: i32) -> i32;
     }
 
-    #[derive(Clone)]
-    struct ArithmeticImpl;
-
-    impl Arithmetic for ArithmeticImpl {
-        async fn add(self, _: context::Context, x: i32, y: i32) -> i32 {
-            x + y
-        }
-    }
-
     fn unique_service_name() -> String {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         format!("tarpc/test/{}/{}", std::process::id(), id)
     }
 
-    type ServerSink = tarpc::Response<ArithmeticResponse>;
-    type ServerItem = tarpc::ClientMessage<ArithmeticRequest>;
-    type ClientSink = tarpc::ClientMessage<ArithmeticRequest>;
-    type ClientItem = tarpc::Response<ArithmeticResponse>;
+    type ServerSink = tarpc::Response<AdderResponse>;
+    type ServerItem = tarpc::ClientMessage<AdderRequest>;
+    type ClientSink = tarpc::ClientMessage<AdderRequest>;
+    type ClientItem = tarpc::Response<AdderResponse>;
 
     async fn run_roundtrip<ServerTransport, ClientTransport, MakeServer, MakeClient>(
         make_server_transport: MakeServer,
-        make_client_transport: MakeClient,
+        _make_client_transport: MakeClient,
     ) -> io::Result<()>
     where
         ServerTransport: Transport<ServerSink, ServerItem> + Send + 'static,
