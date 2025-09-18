@@ -3,14 +3,13 @@ use std::{
     fmt,
     future::Future,
     io,
-    ops::Deref,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
     time::Duration,
 };
 
-use bytes::BytesMut;
+use iceoryx2::sample::Sample;
 use iceoryx2::{
     node::{Node, NodeBuilder, node_name::NodeName},
     port::{
@@ -62,7 +61,8 @@ impl Default for IceoryxConfig {
 pub struct IceoryxStream {
     publisher: Publisher<IoxService, [u8], ()>,
     subscriber: Subscriber<IoxService, [u8], ()>,
-    read_buffer: BytesMut,
+    current_sample: Option<Sample<IoxService, [u8], ()>>,
+    sample_offset: usize,
     poll_interval: Duration,
     wait_state: WaitState,
     empty_poll_streak: u32,
@@ -73,7 +73,13 @@ pub struct IceoryxStream {
 impl fmt::Debug for IceoryxStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IceoryxStream")
-            .field("read_buffer_len", &self.read_buffer.len())
+            .field(
+                "pending_sample_len",
+                &self
+                    .current_sample
+                    .as_ref()
+                    .map(|sample| sample.len().saturating_sub(self.sample_offset)),
+            )
             .field("is_shutdown", &self.is_shutdown)
             .finish()
     }
@@ -101,7 +107,8 @@ impl IceoryxStream {
         Ok(Self {
             publisher,
             subscriber,
-            read_buffer: BytesMut::new(),
+            current_sample: None,
+            sample_offset: 0,
             poll_interval: config.poll_interval,
             wait_state: WaitState::None,
             empty_poll_streak: 0,
@@ -128,6 +135,10 @@ impl AsyncRead for IceoryxStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         let this = self.as_mut().get_mut();
 
         loop {
@@ -149,8 +160,26 @@ impl AsyncRead for IceoryxStream {
                 },
             }
 
-            if !this.read_buffer.is_empty() {
-                break;
+            if let Some(sample) = this.current_sample.take() {
+                let sample_len = sample.len();
+
+                if this.sample_offset >= sample_len {
+                    this.sample_offset = 0;
+                    continue;
+                }
+
+                let available = &sample[this.sample_offset..];
+                let to_copy = min(buf.remaining(), available.len());
+                buf.put_slice(&available[..to_copy]);
+                this.sample_offset += to_copy;
+
+                if this.sample_offset < sample_len {
+                    this.current_sample = Some(sample);
+                } else {
+                    this.sample_offset = 0;
+                }
+
+                return Poll::Ready(Ok(()));
             }
 
             if this.is_shutdown {
@@ -159,7 +188,8 @@ impl AsyncRead for IceoryxStream {
 
             match this.subscriber.receive() {
                 Ok(Some(sample)) => {
-                    this.read_buffer.extend_from_slice(sample.deref());
+                    this.current_sample = Some(sample);
+                    this.sample_offset = 0;
                     this.wait_state = WaitState::None;
                     this.empty_poll_streak = 0;
                     continue;
@@ -185,11 +215,6 @@ impl AsyncRead for IceoryxStream {
                 }
             }
         }
-
-        let to_copy = min(buf.remaining(), this.read_buffer.len());
-        let data = this.read_buffer.split_to(to_copy);
-        buf.put_slice(&data);
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -355,6 +380,7 @@ mod tests {
         context,
         server::{BaseChannel, Channel},
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tarpc::service]
     pub trait Arithmetic {
@@ -403,6 +429,36 @@ mod tests {
 
         drop(client);
         server.abort();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transfers_large_payload_in_chunks() -> io::Result<()> {
+        let base = unique_service_name();
+
+        let mut server_stream =
+            IceoryxStream::connect(&base, Role::Server, IceoryxConfig::default())?;
+        let mut client_stream =
+            IceoryxStream::connect(&base, Role::Client, IceoryxConfig::default())?;
+
+        let payload = vec![0xAB; 1_048_576];
+        let sender_payload = payload.clone();
+        let sender = tokio::spawn(async move {
+            server_stream.write_all(&sender_payload).await?;
+            server_stream.shutdown().await?;
+            Ok::<_, io::Error>(())
+        });
+
+        let mut received = Vec::with_capacity(payload.len());
+        let mut buffer = vec![0u8; 32 * 1024];
+        while received.len() < payload.len() {
+            let read = client_stream.read(&mut buffer).await?;
+            assert!(read > 0, "stream ended before full payload was received");
+            received.extend_from_slice(&buffer[..read]);
+        }
+
+        sender.await.expect("sender task should complete")?;
+        assert_eq!(received, payload);
         Ok(())
     }
 }
