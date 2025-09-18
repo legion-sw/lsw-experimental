@@ -1,6 +1,8 @@
 use std::{
     cmp::min,
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     ops::Deref,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
@@ -62,7 +64,8 @@ pub struct IceoryxStream {
     subscriber: Subscriber<IoxService, [u8], ()>,
     read_buffer: BytesMut,
     poll_interval: Duration,
-    sleep: Option<Pin<Box<Sleep>>>,
+    wait_state: WaitState,
+    empty_poll_streak: u32,
     is_shutdown: bool,
     _node: Node<IoxService>,
 }
@@ -100,7 +103,8 @@ impl IceoryxStream {
             subscriber,
             read_buffer: BytesMut::new(),
             poll_interval: config.poll_interval,
-            sleep: None,
+            wait_state: WaitState::None,
+            empty_poll_streak: 0,
             is_shutdown: false,
             _node: node,
         })
@@ -127,6 +131,24 @@ impl AsyncRead for IceoryxStream {
         let this = self.as_mut().get_mut();
 
         loop {
+            match &mut this.wait_state {
+                WaitState::None => {}
+                WaitState::Yield(fut) => match Pin::new(fut).poll(cx) {
+                    Poll::Ready(()) => {
+                        this.wait_state = WaitState::None;
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                WaitState::Sleep(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Ready(_) => {
+                        this.wait_state = WaitState::None;
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+            }
+
             if !this.read_buffer.is_empty() {
                 break;
             }
@@ -138,19 +160,24 @@ impl AsyncRead for IceoryxStream {
             match this.subscriber.receive() {
                 Ok(Some(sample)) => {
                     this.read_buffer.extend_from_slice(sample.deref());
-                    this.sleep = None;
+                    this.wait_state = WaitState::None;
+                    this.empty_poll_streak = 0;
                     continue;
                 }
                 Ok(None) => {
-                    let sleep_fut = this
-                        .sleep
-                        .get_or_insert_with(|| Box::pin(sleep(this.poll_interval)));
-                    match sleep_fut.as_mut().poll(cx) {
-                        Poll::Ready(_) => {
-                            this.sleep = None;
-                        }
-                        Poll::Pending => return Poll::Pending,
-                    }
+                    this.empty_poll_streak = this
+                        .empty_poll_streak
+                        .saturating_add(1)
+                        .min(FAST_POLL_SPINS);
+                    let should_sleep = this.poll_interval != Duration::ZERO
+                        && this.empty_poll_streak >= FAST_POLL_SPINS;
+
+                    this.wait_state = if should_sleep {
+                        WaitState::Sleep(Box::pin(sleep(this.poll_interval)))
+                    } else {
+                        WaitState::Yield(YieldNowFuture::new())
+                    };
+                    continue;
                 }
                 Err(err) => {
                     let io_err = to_io_error(err);
@@ -194,10 +221,44 @@ impl AsyncWrite for IceoryxStream {
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.is_shutdown = true;
-        this.sleep = None;
+        this.wait_state = WaitState::None;
         Poll::Ready(Ok(()))
     }
 }
+
+const FAST_POLL_SPINS: u32 = 4096;
+
+enum WaitState {
+    None,
+    Yield(YieldNowFuture),
+    Sleep(Pin<Box<Sleep>>),
+}
+
+struct YieldNowFuture {
+    yielded: bool,
+}
+
+impl YieldNowFuture {
+    fn new() -> Self {
+        Self { yielded: false }
+    }
+}
+
+impl Future for YieldNowFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.yielded {
+            Poll::Ready(())
+        } else {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+impl Unpin for YieldNowFuture {}
 
 /// Creates a tarpc transport that serializes messages with [`Bincode`].
 pub fn bincode_transport<Item, SinkItem>(
