@@ -16,7 +16,7 @@ tarpc = { version = "0.37", default-features = false, features = [
     "serde1",
     "tokio1",
 ] }
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
