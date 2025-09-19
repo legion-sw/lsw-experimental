@@ -9,6 +9,7 @@ futures = "0.3"
 iceoryx2 = "0.7"
 bitcode = { version = "0.6", features = ["serde"] }
 postcard = { version = "1", features = ["use-std"] }
+rkyv = { version = "0.7", features = ["validation"] }
 serde = { version = "1", features = ["derive"] }
 tarpc = { version = "0.37", default-features = false, features = [
     "serde-transport",

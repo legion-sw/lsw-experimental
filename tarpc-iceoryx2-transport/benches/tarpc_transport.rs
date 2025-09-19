@@ -5,6 +5,7 @@ use std::{
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::StreamExt;
+use rkyv::{from_bytes, to_bytes};
 use speedy::{LittleEndian, Readable, Writable};
 use tarpc::{
     Transport, context,
@@ -212,6 +213,18 @@ fn frame_roundtrip_benchmark_bitcode(c: &mut Criterion) {
     );
 }
 
+fn rkyv_frame_serialization_benchmark(c: &mut Criterion) {
+    let frame = vec![0u8; 1920 * 1080 * 3];
+
+    c.bench_function("rkyv_frame_roundtrip", |b| {
+        b.iter(|| {
+            let encoded = to_bytes::<_, 256>(&frame).expect("rkyv encode succeeds");
+            let decoded = from_bytes::<Vec<u8>>(&encoded).expect("rkyv decode succeeds");
+            assert_eq!(decoded.len(), frame.len());
+        });
+    });
+}
+
 fn speedy_frame_serialization_benchmark(c: &mut Criterion) {
     let frame = vec![0u8; 1920 * 1080 * 3];
 
@@ -237,6 +250,7 @@ criterion_group!(
     frame_roundtrip_benchmark_bincode,
     frame_roundtrip_benchmark_postcard,
     frame_roundtrip_benchmark_bitcode,
+    rkyv_frame_serialization_benchmark,
     speedy_frame_serialization_benchmark,
 );
 criterion_main!(benches);
